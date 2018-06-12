@@ -41,47 +41,43 @@ namespace kq
 		using Task = std::packaged_task<R()>;
 		Task* task = new Task(f);
 		auto fut = task->get_future();
-		auto payload = new payload_t{.data = task, .fun = [](void* p) {
-			                             Task* t = static_cast<Task*>(p);
-			                             (*t)();
-			                             delete t;
-		                             }};
+		payload_t* payload = new payload_t{.data = task, .fun = [](void* p) {
+			                                   Task* t = static_cast<Task*>(p);
+			                                   (*t)();
+			                                   delete t;
+		                                   }};
 
 		// cannot trigger user event immediately in same change
 		struct kevent ke[2] = {};
 
-		ke[0].ident = reinterpret_cast<uintptr_t>(&run_payload);
+		ke[0].ident = reinterpret_cast<uintptr_t>(payload);
 		ke[0].filter = EVFILT_USER;
-		ke[0].flags = EV_ADD | EV_ONESHOT | EV_UDATA_SPECIFIC;
-		ke[0].udata = payload;
+		ke[0].flags = EV_ADD | EV_ONESHOT;
 
-		ke[1].ident = reinterpret_cast<uintptr_t>(&run_payload);
+		ke[1].ident = reinterpret_cast<uintptr_t>(payload);
 		ke[1].filter = EVFILT_USER;
-		ke[1].flags = EV_UDATA_SPECIFIC;
 		ke[1].fflags = NOTE_TRIGGER;
-		ke[1].udata = payload;
 
 		if (kevent(kq, ke, 2, nullptr, 0, nullptr))
 			perror(__func__), abort();
 		return fut;
 	}
 
-	const uintptr_t cancel_token = -1;
-
-	void cancel(int kq) noexcept
+	int cancel(int kq) noexcept
 	{
 		struct kevent ke[2] = {};
 
-		ke[0].ident = cancel_token;
+		ke[0].ident = 0;
 		ke[0].filter = EVFILT_USER;
 		ke[0].flags = EV_ADD;
 
-		ke[1].ident = cancel_token;
+		ke[1].ident = 0;
 		ke[1].filter = EVFILT_USER;
 		ke[1].fflags = NOTE_TRIGGER;
 
 		if (kevent(kq, ke, 2, nullptr, 0, nullptr) == -1)
-			perror(__func__), abort();
+			return perror(__func__), errno;
+		return 0;
 	}
 } // namespace kq
 
@@ -90,27 +86,33 @@ int main()
 	using namespace std::chrono_literals;
 	const int kq = kqueue();
 	if (kq == -1)
-		perror("kqueue"), abort();
+		return perror("kqueue"), errno;
 	std::thread t([kq] {
 		constexpr int N = 10;
 		struct kevent ke[N];
 		while (1)
 		{
-			//std::this_thread::sleep_for(100ms);
 			const int ne = kevent(kq, nullptr, 0, ke, N, nullptr);
 			if (ne == -1)
-				perror(__func__), abort();
+				return perror(__func__), errno;
 			printf("thread woke from kevent with %i events\n", ne);
 			for (int e = 0; e < ne; ++e)
 			{
-				if (ke[e].ident == reinterpret_cast<uintptr_t>(&kq::run_payload))
-					kq::run_payload(ke[e].udata);
-				else if (ke[e].ident == kq::cancel_token)
-					return; // leaks remaining tasks
-				else
-					printf("unknown ke.ident: %lu\n", ke[e].ident);
+				switch (ke[e].filter)
+				{
+				case EVFILT_USER:
+					if (!ke[e].ident)
+						return 0; // leaks remaining tasks
+					else
+						kq::run_payload(reinterpret_cast<kq::payload_t*>(ke[e].ident));
+					break;
+				default:
+					fprintf(stderr, "unknown kevent filter: %u\n", ke[e].filter);
+					break;
+				}
 			}
 		}
+		return 0;
 	});
 
 	// push tasks
